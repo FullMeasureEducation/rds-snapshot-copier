@@ -90,10 +90,10 @@
                                 {
                                     "Effect": "Allow",
                                     "Action": [
-                                        "rds:DescribeDBInstances",
-                                        "rds:DescribeDBSnapshots",
-                                        "rds:CopyDBSnapshot",
-                                        "rds:DeleteDBSnapshot"
+                                        "rds:DescribeDBClusters",
+                                        "rds:DescribeDBClusterSnapshots",
+                                        "rds:CopyDBClusterSnapshot",
+                                        "rds:DeleteDBClusterSnapshot"
                                     ],
                                     "Resource": "*"
                                 }
@@ -127,7 +127,7 @@
                     "S3Bucket": { "Ref": "ArtifactBucket" },
                     "S3Key": {"Fn::Join": ["/", [{ "Ref": "Release" }, "rds-snapshot-copier.zip"]]}
                 },
-                "Runtime": "nodejs6.10",
+                "Runtime": "nodejs8.10",
                 "Timeout": "300",
                 "Environment": {
                     "Variables": {

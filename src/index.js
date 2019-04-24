@@ -32,229 +32,10 @@ const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
 const SLACK_WARNINGS_CHANNEL = process.env.SLACK_WARNINGS_CHANNEL;
 const SLACK_ALERTS_CHANNEL = process.env.SLACK_ALERTS_CHANNEL;
 
-var enumerateDBInstances = function(exitCallback, dbCallback) {
-  let rdsClient = new aws.RDS();
-  let dbInstances = [];
+const rdsClient = new aws.RDS();
+const rdsClientDr = new aws.RDS({region: DR_REGION});
 
-  rdsClient.describeDBInstances().on('success', function enumerateDBs(response) {
-    response.data.DBInstances.forEach(function(dbInstance) {
-      dbInstances.push(dbInstance);
-    });
-    if(response.hasNextPage()) {
-      response.nextPage().on('success', enumerateDBs).send();
-    }
-    else {
-      let promises = [];
-
-      dbInstances.forEach(function(dbInstance) {
-        promises.push(new Promise(function(resolve, reject) {
-          dbCallback(dbInstance, function(err) {
-            if(err) {
-              reject(err);
-            }
-            else {
-              resolve();
-            }
-          });
-        }));
-      });
-
-      Promise.all(promises).then(function() {
-        exitCallback(null);
-      }, function(err) {
-        logError(JSON.stringify(err));
-        exitCallback(err);
-      });
-    }
-  }).on('error', function(err) {
-    logError('Error encountered enumerating instances: ' + JSON.stringify(err));
-    exitCallback(err);
-  }).send();
-};
-
-var rotateDisasterRecoverySnapshots = function(dbInstanceId, rotationDate, disableAgeCheck, callback) {
-  if(!matchDbInstanceFilter(dbInstanceId)) {
-    logMessage("Skipping database b/c it does not match instance filter", dbInstanceId);
-    return callback(null);
-  }
-
-  copySnapshots(dbInstanceId, rotationDate, disableAgeCheck, function(err, success) {
-    if(err) {
-      logError('Error encountered while copying snapshots: ' + JSON.stringify(err), dbInstanceId);
-      callback(err);
-    }
-    else {
-      deleteOldSnapshots(dbInstanceId, rotationDate, function(err, succcess) {
-        if(err) {
-          logError('Error encountered while deleting snapshots: ' + JSON.stringify(err), dbInstanceId);
-        }
-        callback(err, success);
-      });
-    }
-  });
-};
-
-var matchDbInstanceFilter = function(dbInstanceId) {
-  if(!DATABASE_INSTANCE_FILTER) return true;
-  let dbInstanceFilterRegex = new RegExp(DATABASE_INSTANCE_FILTER);
-  return dbInstanceId.match(dbInstanceFilterRegex);
-};
-
-var copySnapshots = function(dbInstanceId, rotationDate, disableAgeCheck, callback) {
-  let rdsClient = new aws.RDS();
-  let rdsClientDr = new aws.RDS({region: DR_REGION});
-  let maybeCopySnapshots = [];
-
-  logMessage('Kicking off snapshot copies', dbInstanceId);
-  logMessage('Retrieving snapshots for database instance', dbInstanceId);
-
-  rdsClient.describeDBSnapshots({
-    DBInstanceIdentifier: dbInstanceId,
-    IncludePublic: false,
-    IncludeShared: false,
-    SnapshotType: 'automated'
-  }).on('success', function enumerateSnapshots(response) {
-    response.data.DBSnapshots.forEach(function(snapshot) {
-      if(snapshot.Status == 'available' && snapshot.SnapshotCreateTime.getTime() > rotationDate.getTime()) {
-        maybeCopySnapshots.push(snapshot);
-      }
-    });
-
-    if(response.hasNextPage()) {
-      response.nextPage().on('success', enumerateSnapshots).send();
-    }
-    else {
-      let promises = [];
-
-      if(maybeCopySnapshots.length == 0) {
-        logMessage('No snapshots need to be copied to the DR region', dbInstanceId);
-        return callback(null, 'success');
-      }
-
-      let snapshotListStr = maybeCopySnapshots.map(function(item) {
-        return item.DBSnapshotIdentifier;
-      }).join(', ');
-      logMessage('Evaluating snapshots for copy: ' + snapshotListStr, dbInstanceId);
-
-      maybeCopySnapshots.forEach(function(snapshot) {
-        promises.push(new Promise(function(resolve, reject) {
-          let drSnapshotId = snapshot.DBSnapshotIdentifier.replace('rds:', '');
-          let nowTimestamp = (new Date().getTime()) / 1000;
-          let snapshotTimestamp = (new Date(snapshot.SnapshotCreateTime).getTime()) / 1000;
-          let snapshotAgeHours = (nowTimestamp - snapshotTimestamp) / 60 / 60;
-
-          rdsClientDr.describeDBSnapshots({DBSnapshotIdentifier: drSnapshotId}, function(err, data) {
-            if(!err || err.code != 'DBSnapshotNotFound') {
-              logMessage("Snapshot " + drSnapshotId + " already exists in DR region.", dbInstanceId);
-              return resolve();
-            }
-
-            if(!disableAgeCheck) {
-              let snapshotAgeMsg = "Snapshot " + drSnapshotId + " is " + snapshotAgeHours.toFixed(1) +
-                " hours old and has not been copied to the DR region";
-              if(snapshotAgeHours > SNAPSHOT_COPY_AGE_ALERT) {
-                logError(snapshotAgeMsg, dbInstanceId);
-              }
-              else if(snapshotAgeHours > SNAPSHOT_COPY_AGE_WARNING) {
-                logWarning(snapshotAgeMsg, dbInstanceId);
-              }
-            }
-
-            let params = {
-              SourceDBSnapshotIdentifier: snapshot.DBSnapshotArn,
-              TargetDBSnapshotIdentifier: drSnapshotId,
-              CopyTags: true,
-              SourceRegion: snapshot.AvailabilityZone.replace(/[a-z]$/, '')
-            };
-            if(snapshot.Encrypted) {
-              params.KmsKeyId = DR_KMS_KEY;
-            }
-
-            logMessage('Copying snapshot ' + drSnapshotId + ' to DR region', dbInstanceId);
-            rdsClientDr.copyDBSnapshot(params)
-              .on('success', resolve)
-              .on('error', function(err) {
-                if(err.code == 'SnapshotQuotaExceeded') {
-                  logWarning('Ignoring snapshot copy quota error: ' + JSON.stringify(err), dbInstanceId);
-                  resolve();
-                }
-                else {
-                  reject(err);
-                }
-              }).send();
-          });
-        }));
-      });
-
-      Promise.all(promises).then(function() {
-        callback(null, 'success');
-      }, function(err) {
-        logError('Error encountered executing snapshot copy: ' + JSON.stringify(err), dbInstanceId);
-        callback(err);
-      });
-    }
-  }).on('error', function(err) {
-    logError('Error encountered during snapshot enumeration: ' + JSON.stringify(err), dbInstanceId);
-    callback(err);
-  }).send();
-};
-
-var deleteOldSnapshots = function(dbInstanceId, rotationDate, callback) {
-  let rdsClient = new aws.RDS({region: DR_REGION});
-  let oldestAllowedSnapshot = dbInstanceId + '-' +
-    dateFormat(rotationDate, 'yyyy-mm-dd-HH-MM');
-  let oldSnapshots = [];
-
-  logMessage('Kicking off snapshot deletion in DR region', dbInstanceId);
-  logMessage('Finding snapshots older than ' + oldestAllowedSnapshot, dbInstanceId);
-
-  rdsClient.describeDBSnapshots({
-    DBInstanceIdentifier: dbInstanceId,
-    IncludePublic: false,
-    IncludeShared: false,
-    SnapshotType: 'manual'
-  }).on('success', function enumerateSnapshots(response) {
-    response.data.DBSnapshots.forEach(function(snapshot) {
-      if(snapshot.DBSnapshotIdentifier < oldestAllowedSnapshot) {
-        oldSnapshots.push(snapshot.DBSnapshotIdentifier);
-      }
-    })
-
-    if(response.hasNextPage()) {
-      response.nextPage().on('success', enumerateSnapshots).send();
-    }
-    else {
-      let promises = [];
-
-      if(oldSnapshots.length == 0) {
-        logMessage('No snapshots marked for deletion', dbInstanceId);
-        return callback(null, 'success');
-      }
-
-      oldSnapshots.forEach(function(snapshotId) {
-        promises.push(new Promise(function(resolve, reject) {
-          logMessage('Deleting snapshot ' + snapshotId, dbInstanceId);
-          rdsClient.deleteDBSnapshot({DBSnapshotIdentifier: snapshotId})
-            .on('success', resolve)
-            .on('error', reject)
-            .send();
-        }));
-      });
-
-      Promise.all(promises).then(function() {
-        callback(null, 'success');
-      }, function(err) {
-        logError('Error encountered during snapshot deletion: ' + JSON.stringify(err), dbInstanceId);
-        callback(err);
-      });
-    }
-  }).on('error', function(err) {
-    logError('Error encountered during snapshot enumeration: ' + JSON.stringify(err), dbInstanceId);
-    callback(err);
-  }).send();
-};
-
-var formatLogMessage = function(level, msg, dbInstanceId) {
+let formatLogMessage = function(level, msg, dbInstanceId) {
   if(dbInstanceId) {
     return level + ': [' + dbInstanceId + '] ' + msg;
   }
@@ -263,11 +44,11 @@ var formatLogMessage = function(level, msg, dbInstanceId) {
   }
 };
 
-var logMessage = function(msg, dbInstanceId) {
+const logMessage = function(msg, dbInstanceId) {
   console.log(formatLogMessage('INFO', msg, dbInstanceId));
 };
 
-var logWarning = function(msg, dbInstanceId) {
+const logWarning = function(msg, dbInstanceId) {
   let formattedMsg = formatLogMessage('WARN', msg, dbInstanceId);
   console.log(formattedMsg);
   if(SLACK_WARNINGS_CHANNEL) {
@@ -275,7 +56,7 @@ var logWarning = function(msg, dbInstanceId) {
   }
 };
 
-var logError = function(msg, dbInstanceId) {
+const logError = function(msg, dbInstanceId) {
   let formattedMsg = formatLogMessage('ERR', msg, dbInstanceId);
   console.log(formattedMsg);
   if(SLACK_ALERTS_CHANNEL) {
@@ -283,12 +64,12 @@ var logError = function(msg, dbInstanceId) {
   }
 };
 
-var sendNotification = function(channel, msg) {
+const sendNotification = function(channel, msg) {
   if(!SLACK_WEBHOOK_URL) {
     return;
   }
-  let webhook = new slackWebHook(SLACK_WEBHOOK_URL);
-  let params = {
+  const webhook = new slackWebHook(SLACK_WEBHOOK_URL);
+  const params = {
     username: 'RDSSnapshotCopier',
     iconEmoji: ':robot_face:',
     channel: channel,
@@ -296,67 +77,157 @@ var sendNotification = function(channel, msg) {
   };
   webhook.send(params, function(err) {
     if(err) {
-      console.log(formatLogMessage('ERR', 'Failed to send Slack notification: ' + msg, dbInstanceId));
+      console.log(formatLogMessage('ERR', 'Failed to send Slack notification: ' + msg + " to " + channel));
     }
   });
 };
 
-exports.handler = function(event, context, callback) {
-  logMessage('Received event: ' + JSON.stringify(event));
+const dbClusters = async function() {
+  const results = await rdsClient.describeDBClusters({
+    MaxRecords: 100
+  }).promise();
+  return results.DBClusters;
+};
 
-  let events = [];
-  if(event.Records) {
-    events = event.Records;
+const dbClusterSnapshots = async function(clusterIdentifier) {
+  const results = await rdsClient.describeDBClusterSnapshots({
+    MaxRecords: 100,
+    DBClusterIdentifier: clusterIdentifier,
+    SnapshotType: 'automated'
+  }).promise();
+  return results.DBClusterSnapshots;
+};
+
+const dbClusterSnapshotDr = async function(snapshotIdentifier) {
+  return await rdsClientDr.describeDBClusterSnapshots({
+    DBClusterSnapshotIdentifier: snapshotIdentifier
+  }).promise();
+};
+
+const matchDbInstanceFilter = function(dbInstanceId) {
+  if(!DATABASE_INSTANCE_FILTER) return true;
+  const dbInstanceFilterRegex = new RegExp(DATABASE_INSTANCE_FILTER);
+  return dbInstanceId.match(dbInstanceFilterRegex);
+};
+
+const rotateDisasterRecoverySnapshots = async function(dbInstanceId, rotationDate) {
+  await copySnapshots(dbInstanceId, rotationDate);
+  await deleteOldSnapshots(dbInstanceId, rotationDate);
+};
+
+const copySnapshots = async function(clusterIdentifier, rotationDate) {
+  const maybeCopySnapshots = [];
+
+  logMessage('Kicking off snapshot copies', clusterIdentifier);
+  const clusterSnapshots = await dbClusterSnapshots(clusterIdentifier);
+  for (const snapshot of clusterSnapshots) {
+    if(snapshot.Status === 'available' && snapshot.SnapshotCreateTime.getTime() > rotationDate.getTime()) {
+      maybeCopySnapshots.push(snapshot);
+    }
   }
-  else {
-    events = [event];
+  if(maybeCopySnapshots.length === 0) {
+    logMessage('No snapshots need to be copied to the DR region', clusterIdentifier);
+    return;
   }
+
+  let snapshotListStr = maybeCopySnapshots.map(function(snapshot) {
+    return snapshot.DBClusterSnapshotIdentifier.replace('rds:', '');
+  }).join(', ');
+  logMessage('Evaluating snapshots for copy: ' + snapshotListStr, clusterIdentifier);
+
+  for (const snapshot of maybeCopySnapshots) {
+    let drSnapshotId = snapshot.DBClusterSnapshotIdentifier.replace('rds:', '');
+    let nowTimestamp = (new Date().getTime()) / 1000;
+    let snapshotTimestamp = (new Date(snapshot.SnapshotCreateTime).getTime()) / 1000;
+    let snapshotAgeHours = (nowTimestamp - snapshotTimestamp) / 60 / 60;
+    try {
+      await dbClusterSnapshotDr(drSnapshotId);
+      logMessage("Snapshot " + drSnapshotId + " already exists in DR region.", clusterIdentifier);
+    } catch (error) {
+      if(error.code === 'DBClusterSnapshotNotFoundFault') {
+        let snapshotAgeMsg = "Snapshot " + drSnapshotId + " is " + snapshotAgeHours.toFixed(1) +
+            " hours old and has not been copied to the DR region";
+        if(snapshotAgeHours > SNAPSHOT_COPY_AGE_ALERT) {
+          logError(snapshotAgeMsg, clusterIdentifier);
+        }
+        else if(snapshotAgeHours > SNAPSHOT_COPY_AGE_WARNING) {
+          logWarning(snapshotAgeMsg, clusterIdentifier);
+        }
+        const params = {
+          SourceDBClusterSnapshotIdentifier: snapshot.DBClusterSnapshotArn,
+          TargetDBClusterSnapshotIdentifier: drSnapshotId,
+          CopyTags: true,
+          SourceRegion: snapshot.DBClusterSnapshotArn.split(":")[3]
+        };
+        if(snapshot.StorageEncrypted) {
+          params.KmsKeyId = DR_KMS_KEY;
+        }
+        logMessage('Copying snapshot ' + drSnapshotId + ' to DR region', clusterIdentifier);
+        try {
+          await rdsClientDr.copyDBClusterSnapshot(params).promise();
+        } catch (error) {
+          if(error.code === 'SnapshotQuotaExceeded') {
+            logWarning('Ignoring snapshot copy quota error: ' + JSON.stringify(error), clusterIdentifier);
+          } else {
+            throw error;
+          }
+        }
+      } else {
+        throw error;
+      }
+    }
+  }
+};
+
+const deleteOldSnapshots = async function(clusterIdentifier, rotationDate) {
+  const oldestAllowedSnapshot = clusterIdentifier + '-' + dateFormat(rotationDate, 'yyyy-mm-dd-HH-MM');
+  const oldSnapshots = [];
+
+  logMessage('Kicking off snapshot deletion in DR region', clusterIdentifier);
+  logMessage('Finding snapshots older than ' + oldestAllowedSnapshot, clusterIdentifier);
+
+  const destinationSnapshotsResponse = await rdsClientDr.describeDBClusterSnapshots({
+    DBClusterIdentifier: clusterIdentifier,
+    MaxRecords: 100,
+    SnapshotType: 'manual'
+  }).promise();
+  for (const snapshot of destinationSnapshotsResponse.DBClusterSnapshots) {
+    if(snapshot.DBClusterSnapshotIdentifier < oldestAllowedSnapshot) {
+      oldSnapshots.push(snapshot.DBClusterSnapshotIdentifier);
+    }
+  }
+  if(oldSnapshots.length === 0) {
+    logMessage('No snapshots marked for deletion', clusterIdentifier);
+  } else {
+    for (const oldSnapshotId of oldSnapshots) {
+      logMessage('Deleting snapshot ' + oldSnapshotId, clusterIdentifier);
+      await rdsClientDr.deleteDBClusterSnapshot({DBClusterSnapshotIdentifier: oldSnapshotId}).promise();
+    }
+  }
+};
+
+exports.handler = async function(event) {
+  logMessage('Received event: ' + JSON.stringify(event));
 
   let rotationDate = new Date();
   rotationDate.setDate(rotationDate.getDate() - MAINTAIN_X_SNAPSHOTS);
 
-  events.forEach(function(e) {
-    try {
-      if((e.command && e.command == 'initial_sync') || (e.source && e.source == 'aws.events')) {
-        let disableAgeCheck = e.command && e.command == 'initial_sync';
-        logMessage('Kicking off snapshot rotation for all instances');
-        enumerateDBInstances(callback, function(dbInstance) {
-          let dbInstanceId = dbInstance.DBInstanceIdentifier;
-          if(dbInstance.BackupRetentionPeriod != 0) {
-            rotateDisasterRecoverySnapshots(dbInstanceId, rotationDate, disableAgeCheck, callback);
-          }
-          else {
-            logMessage('Skipping snapshot rotation b/c backups are disabled', dbInstanceId);
-          }
-        });
-      }
-      else if(e.EventSource && e.EventSource == 'aws:sns') {
-        let message = JSON.parse(e.Sns.Message);
-        if(message['Event ID'].match('#RDS-EVENT-0002$')) {
-          let dbInstanceId = message['Source ID'];
-          logMessage('Kicking off snapshot rotation for database', dbInstanceId);
-          rotateDisasterRecoverySnapshots(dbInstanceId, rotationDate, true, callback);
+  try {
+    logMessage('Kicking off snapshot rotation for all instances');
+    const clusters = await dbClusters();
+    for (let cluster of clusters) {
+      let clusterIdentifier = cluster.DBClusterIdentifier;
+      if(cluster.BackupRetentionPeriod !== 0) {
+        if(matchDbInstanceFilter(clusterIdentifier)) {
+          await rotateDisasterRecoverySnapshots(clusterIdentifier, rotationDate);
+        } else {
+          logMessage("Skipping database b/c it does not match filter", clusterIdentifier);
         }
-      }
-      else if(e.command && e.command == 'initial_sync') {
-        logMessage('Recieved command initial_sync');
-        logMessage('Kicking off snapshot rotation for all instances');
-        enumerateDBInstances(callback, function(dbInstance) {
-          let dbInstanceId = dbInstance.DBInstanceIdentifier;
-          if(dbInstance.BackupRetentionPeriod != 0) {
-            rotateDisasterRecoverySnapshots(dbInstanceId, rotationDate, true, callback);
-          }
-          else {
-            logMessage('Skipping snapshot rotation b/c backups are disabled', dbInstanceId);
-          }
-        });
-      }
-      else {
-        logError('Encountered an unexpected event: ' + JSON.stringify(e));
+      } else {
+        logMessage('Skipping snapshot rotation b/c backups are disabled', clusterIdentifier);
       }
     }
-    catch(err) {
-      logError('Fatal error: ' + JSON.stringify(err));
-    }
-  });
+  } catch(err) {
+    logError('Fatal error: ' + JSON.stringify(err));
+  }
 };
